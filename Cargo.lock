@@ -727,7 +727,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 [[package]]
 name = "mimesis"
 version = "0.1.0"
-source = "git+https://github.com/jhnngrn/mimesis-rs?branch=master#ad3383d16f588b438c25617f29bcba4b3719156f"
+source = "git+https://github.com/jhnngrn/mimesis-rs?branch=master#805302bbcf36fa0ce59fd6e6ef5acef5717886b8"
 dependencies = [
  "argon2",
  "base64 0.22.1",

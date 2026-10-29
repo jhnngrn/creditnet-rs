@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use mimesis::module::{HandleResult, Module, OutboxCandidate};
-use mimesis::sync_object::{KickFn, SyncObject};
+use mimesis::module::{HandleResult, Module};
+use mimesis::registry::RegistryRef;
+use mimesis::sync_object::SyncObject;
 
 /// Directional constants matching creditnet convention.
 pub const IN: usize = 0;
@@ -86,8 +87,8 @@ pub type ConnectedPeersFn = Box<dyn Fn() -> Vec<String> + Send + Sync>;
 pub struct Triad {
     /// Each novation owns its own SyncObject with per-peer queues.
     pub novations: HashMap<String, SyncObject<Novation>>,
-    /// Kick callback, cloned into each new SyncObject<Novation>.
-    kick: Option<KickFn>,
+    /// Registry reference for creating SyncObjects.
+    registry: Option<RegistryRef>,
     pub name: String,
     pub node_id: String,
     bandwidth: Option<BandwidthFn>,
@@ -102,7 +103,7 @@ impl Triad {
     pub fn new(
         name: String,
         node_id: String,
-        kick: KickFn,
+        registry: RegistryRef,
         bandwidth: BandwidthFn,
         pending_balance: PendingBalanceFn,
         add_balance: AddBalanceFn,
@@ -111,7 +112,7 @@ impl Triad {
     ) -> Self {
         Triad {
             novations: HashMap::new(),
-            kick: Some(kick),
+            registry: Some(registry),
             name,
             node_id,
             bandwidth: Some(bandwidth),
@@ -126,7 +127,7 @@ impl Triad {
     pub fn for_test(name: &str, node_id: &str) -> Self {
         Triad {
             novations: HashMap::new(),
-            kick: None,
+            registry: None,
             name: name.to_string(),
             node_id: node_id.to_string(),
             bandwidth: None,
@@ -137,13 +138,20 @@ impl Triad {
         }
     }
 
-    /// Insert a new novation, wrapping it in a SyncObject with the kick callback.
+    /// Insert a new novation, wrapping it in a SyncObject registered in the registry.
     fn insert_novation(&mut self, id: String, nov: Novation) {
-        let so = match &self.kick {
-            Some(k) => SyncObject::new(nov, std::sync::Arc::clone(k)),
-            None => SyncObject::without_kick(nov),
+        let so = match &self.registry {
+            Some(reg) => SyncObject::new(nov, reg, &self.name),
+            None => SyncObject::without_registry(nov),
         };
         self.novations.insert(id, so);
+    }
+
+    /// True if this module has any active novation involving the peer.
+    pub fn busy(&self, peer: &str) -> bool {
+        self.novations
+            .values()
+            .any(|so| so.data.side[IN] == peer || so.data.side[OUT] == peer)
     }
 
     /// How much capacity is reserved by in-flight novations on a peer+side.
@@ -548,12 +556,6 @@ impl Module for Triad {
         Some(serde_json::json!({"novations": novs}))
     }
 
-    fn busy(&self, peer: &str) -> bool {
-        self.novations
-            .values()
-            .any(|so| so.data.side[IN] == peer || so.data.side[OUT] == peer)
-    }
-
     fn force_remove(&mut self, peer: &str) {
         let ids: Vec<String> = self.novations.keys().cloned().collect();
         for id in ids {
@@ -592,31 +594,11 @@ impl Module for Triad {
         }
     }
 
-    fn collect_outbox(&self, peer: &str) -> Vec<OutboxCandidate> {
-        // Find the first novation that has a pending entry for this peer.
-        // queue_id = novation_id, so dequeue knows which SyncObject to use.
-        for (id, so) in &self.novations {
-            if let Some(entry) = so.peek(peer) {
-                return vec![OutboxCandidate {
-                    method: entry.method.clone(),
-                    payload: entry.payload.clone(),
-                    queued_at: entry.time,
-                    queue_id: id.clone(),
-                }];
-            }
+    fn reattach_sync_objects(&mut self, registry: &RegistryRef) {
+        self.registry = Some(registry.clone());
+        for so in self.novations.values_mut() {
+            so.reattach(registry, &self.name);
         }
-        vec![]
-    }
-
-    fn dequeue(&mut self, peer: &str, queue_id: &str) {
-        // queue_id is the novation_id.
-        if let Some(so) = self.novations.get_mut(queue_id) {
-            so.dequeue(peer);
-        }
-    }
-
-    fn outbox_has(&self, peer: &str) -> bool {
-        self.novations.values().any(|so| so.has_pending(peer))
     }
 }
 
@@ -638,9 +620,10 @@ fn random_novation_id() -> String {
 mod tests {
     use super::*;
 
-    /// Helper: insert a raw novation (no kick) for testing.
+    /// Helper: insert a novation for testing. Uses the Triad's own
+    /// insert_novation so the SyncObject gets a registry when one is set.
     fn insert_test_nov(t: &mut Triad, id: &str, nov: Novation) {
-        t.novations.insert(id.to_string(), SyncObject::without_kick(nov));
+        t.insert_novation(id.to_string(), nov);
     }
 
     #[test]
@@ -678,7 +661,9 @@ mod tests {
 
     #[test]
     fn triad_commit_creates_novation() {
+        let reg = mimesis::registry::new_registry();
         let mut t = Triad::for_test("triad", "alice@a.com");
+        t.registry = Some(reg.clone());
         // Stub: always connected, unlimited bandwidth.
         t.is_connected = Some(Box::new(|_| true));
         t.bandwidth = Some(Box::new(|_, _| 1_000_000));
@@ -726,7 +711,9 @@ mod tests {
 
     #[test]
     fn triad_force_remove_rolls_back_out_side() {
+        let reg = mimesis::registry::new_registry();
         let mut t = Triad::for_test("triad", "alice@a.com");
+        t.registry = Some(reg.clone());
         insert_test_nov(&mut t, "n1", Novation {
             amount: 100,
             side: ["charlie@c.com".into(), "bob@b.com".into()],
@@ -742,53 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn triad_collect_outbox_returns_head() {
-        let mut t = Triad::for_test("triad", "alice@a.com");
-        insert_test_nov(&mut t, "nov-a", Novation {
-            amount: 100,
-            side: ["bob@b.com".into(), "".into()],
-            initiator: false,
-        });
-        // Queue two messages on nov-a's SyncObject for bob.
-        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "commit", None);
-        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "finalize", None);
-
-        let candidates = t.collect_outbox("bob@b.com");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].method, "commit");
-        assert_eq!(candidates[0].queue_id, "nov-a"); // queue_id = novation_id
-    }
-
-    #[test]
-    fn triad_dequeue_uses_novation_id() {
-        let mut t = Triad::for_test("triad", "alice@a.com");
-        insert_test_nov(&mut t, "nov-a", Novation {
-            amount: 100,
-            side: ["bob@b.com".into(), "".into()],
-            initiator: false,
-        });
-        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "commit", None);
-        t.novations.get_mut("nov-a").unwrap().send("bob@b.com", "finalize", None);
-
-        // Dequeue using novation_id as queue_id.
-        t.dequeue("bob@b.com", "nov-a");
-        let entry = t.novations["nov-a"].peek("bob@b.com").unwrap();
-        assert_eq!(entry.method, "finalize");
-    }
-
-    #[test]
     fn triad_drop_cleans_up_queues() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        let kick_count = Arc::new(AtomicUsize::new(0));
-        let kc = kick_count.clone();
-        let kick: KickFn = Arc::new(move |_| {
-            kc.fetch_add(1, Ordering::SeqCst);
-        });
-
+        let reg = mimesis::registry::new_registry();
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.kick = Some(kick);
+        t.registry = Some(reg.clone());
         t.insert_novation("n1".into(), Novation {
             amount: 100,
             side: ["bob@b.com".into(), "".into()],
@@ -796,12 +740,10 @@ mod tests {
         });
         // Queue a message so there's something to clean up.
         t.novations.get_mut("n1").unwrap().send("bob@b.com", "commit", None);
+        assert_eq!(reg.lock().unwrap().ref_count("triad"), 1);
 
-        // Reset counter (send already kicked once).
-        kick_count.store(0, Ordering::SeqCst);
-
-        // Remove novation — Drop should kick bob.
+        // Remove novation — Drop should unregister from registry.
         t.novations.remove("n1");
-        assert_eq!(kick_count.load(Ordering::SeqCst), 1);
+        assert_eq!(reg.lock().unwrap().ref_count("triad"), 0);
     }
 }
