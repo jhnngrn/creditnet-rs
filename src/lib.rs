@@ -1,1 +1,1 @@
-pub mod triad;
+pub mod modules;
