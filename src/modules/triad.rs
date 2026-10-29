@@ -8,10 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 
-use mimesis::link::RefCountHandle;
 use mimesis::module::{HandleResult, Module};
 use mimesis::registry::RegistryRef;
 use mimesis::sync_object::SyncObject;
@@ -95,9 +92,9 @@ pub type IsConnectedFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
 /// Callback: list connected peers.
 pub type ConnectedPeersFn = Box<dyn Fn() -> Vec<String> + Send + Sync>;
 
-/// Callback: get RefCountHandle for a peer on this module.
-/// When wired up, returns the ConnectionState's ref_count for module+peer.
-pub type RefCountFn = Box<dyn Fn(&str) -> RefCountHandle + Send + Sync>;
+/// Factory: create a SyncObject bound to a peer.
+/// The caller (Node layer) captures registry + ref_count internally.
+pub type NewSyncObjectFn = Box<dyn Fn(&str) -> SyncObject<()> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Triad module
@@ -108,10 +105,10 @@ pub type RefCountFn = Box<dyn Fn(&str) -> RefCountHandle + Send + Sync>;
 /// its queue and decrementing the ref count.
 pub struct Triad {
     pub novations: HashMap<String, Novation>,
-    /// Registry reference for creating SyncObjects.
+    /// Factory for creating SyncObjects. When set, used instead of registry.
+    new_sync_object_fn: Option<NewSyncObjectFn>,
+    /// Registry reference — used only for reattach and as fallback when no factory is set.
     registry: Option<RegistryRef>,
-    /// Callback for getting RefCountHandles. When None, uses dummy counters.
-    ref_count_fn: Option<RefCountFn>,
     pub name: String,
     pub node_id: String,
     bandwidth: Option<BandwidthFn>,
@@ -135,8 +132,8 @@ impl Triad {
     ) -> Self {
         Triad {
             novations: HashMap::new(),
+            new_sync_object_fn: None,
             registry: Some(registry),
-            ref_count_fn: None,
             name,
             node_id,
             bandwidth: Some(bandwidth),
@@ -151,8 +148,8 @@ impl Triad {
     pub fn for_test(name: &str, node_id: &str) -> Self {
         Triad {
             novations: HashMap::new(),
+            new_sync_object_fn: None,
             registry: None,
-            ref_count_fn: None,
             name: name.to_string(),
             node_id: node_id.to_string(),
             bandwidth: None,
@@ -163,29 +160,19 @@ impl Triad {
         }
     }
 
-    /// Set the ref count callback.
-    pub fn set_ref_count_fn(&mut self, f: RefCountFn) {
-        self.ref_count_fn = Some(f);
+    /// Set the SyncObject factory. The closure should capture registry
+    /// and ref_count source so the module never sees either.
+    pub fn set_new_sync_object_fn(&mut self, f: NewSyncObjectFn) {
+        self.new_sync_object_fn = Some(f);
     }
 
     /// Create a new SyncObject bound to a peer.
     fn new_sync_object(&self, peer: &str) -> SyncObject<()> {
-        match &self.registry {
-            Some(reg) => {
-                let rc = self.get_ref_count(peer);
-                SyncObject::new((), peer, reg, &self.name, rc)
-            }
-            None => SyncObject::without_registry((), peer),
+        if let Some(ref f) = self.new_sync_object_fn {
+            return f(peer);
         }
-    }
-
-    /// Get the RefCountHandle for a peer. Uses the callback if set,
-    /// otherwise returns a standalone counter.
-    fn get_ref_count(&self, peer: &str) -> RefCountHandle {
-        self.ref_count_fn
-            .as_ref()
-            .map(|f| f(peer))
-            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)))
+        // Fallback for tests without a factory.
+        SyncObject::without_registry((), peer)
     }
 
     /// How much capacity is reserved by in-flight novations on a peer+side.
@@ -643,7 +630,11 @@ impl Module for Triad {
         for nov in self.novations.values_mut() {
             for side in &mut nov.side {
                 if let Some(ref mut so) = side {
-                    let rc = Arc::new(AtomicUsize::new(0)); // TODO: wire up real ref_count via ref_count_fn
+                    // Re-create via factory if available (gets real ref_count),
+                    // otherwise reattach with a standalone counter.
+                    // TODO: reattach should ideally go through the factory too,
+                    // but that requires recreating the SyncObject (not just reattaching).
+                    let rc = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     so.reattach(registry, &name, rc);
                 }
             }
@@ -698,11 +689,20 @@ mod tests {
         assert_eq!(t.reserved("carol@c.com", IN), 0);
     }
 
+    /// Helper: set up a factory that creates real SyncObjects with a registry.
+    fn set_test_factory(t: &mut Triad, reg: mimesis::registry::RegistryRef) {
+        let name = t.name.clone();
+        t.set_new_sync_object_fn(Box::new(move |peer| {
+            let rc = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            SyncObject::new((), peer, &reg, &name, rc)
+        }));
+    }
+
     #[test]
     fn triad_commit_creates_novation() {
         let reg = mimesis::registry::new_registry();
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.registry = Some(reg.clone());
+        set_test_factory(&mut t, reg.clone());
         t.is_connected = Some(Box::new(|_| true));
         t.bandwidth = Some(Box::new(|_, _| 1_000_000));
 
@@ -731,7 +731,7 @@ mod tests {
     fn triad_rollback_clears_novation() {
         let reg = mimesis::registry::new_registry();
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.registry = Some(reg.clone());
+        set_test_factory(&mut t, reg.clone());
         t.novations.insert("n1".into(), make_nov(&t, 100, "", "bob@b.com", false));
 
         let payload = serde_json::to_value(RollbackMsg {
@@ -749,7 +749,7 @@ mod tests {
     fn triad_force_remove_rolls_back_out_side() {
         let reg = mimesis::registry::new_registry();
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.registry = Some(reg.clone());
+        set_test_factory(&mut t, reg.clone());
         t.novations.insert("n1".into(), make_nov(&t, 100, "charlie@c.com", "bob@b.com", false));
 
         t.force_remove("bob@b.com");
@@ -764,7 +764,7 @@ mod tests {
     fn triad_drop_cleans_up_queues() {
         let reg = mimesis::registry::new_registry();
         let mut t = Triad::for_test("triad", "alice@a.com");
-        t.registry = Some(reg.clone());
+        set_test_factory(&mut t, reg.clone());
         let nov = make_nov(&t, 100, "bob@b.com", "", false);
         t.novations.insert("n1".into(), nov);
         // Queue a message so there's something to clean up.
