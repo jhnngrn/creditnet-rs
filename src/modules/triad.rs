@@ -692,7 +692,7 @@ mod tests {
         let name = t.name.clone();
         t.set_new_sync_object_fn(Box::new(move |peer| {
             let tracker = mimesis::link::ChildTracker::new();
-            SyncObject::new((), peer, &reg, &name, tracker)
+            SyncObject::new((), peer, &reg, &name, tracker, mimesis::link::ConnectMode::Auto)
         }));
     }
 
