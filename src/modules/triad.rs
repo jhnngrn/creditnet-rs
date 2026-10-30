@@ -477,8 +477,8 @@ impl Triad {
 // ---------------------------------------------------------------------------
 
 impl Module for Triad {
-    fn on_connect(&mut self, _peer: &str) {}
-    fn on_close(&mut self, _peer: &str) {}
+    fn on_connect(&mut self, _peer: &str, _payload: Option<Value>) {}
+    fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
 
     fn handle_request(
         &mut self,
