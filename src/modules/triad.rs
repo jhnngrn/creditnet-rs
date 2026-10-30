@@ -630,12 +630,10 @@ impl Module for Triad {
         for nov in self.novations.values_mut() {
             for side in &mut nov.side {
                 if let Some(ref mut so) = side {
-                    // Re-create via factory if available (gets real ref_count),
-                    // otherwise reattach with a standalone counter.
-                    // TODO: reattach should ideally go through the factory too,
-                    // but that requires recreating the SyncObject (not just reattaching).
-                    let rc = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    so.reattach(registry, &name, rc);
+                    // Reattach with a standalone child tracker.
+                    // TODO: should ideally get the real tracker from the ConnectionState.
+                    let tracker = mimesis::link::ChildTracker::new();
+                    so.reattach(registry, &name, tracker);
                 }
             }
         }
@@ -693,8 +691,8 @@ mod tests {
     fn set_test_factory(t: &mut Triad, reg: mimesis::registry::RegistryRef) {
         let name = t.name.clone();
         t.set_new_sync_object_fn(Box::new(move |peer| {
-            let rc = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            SyncObject::new((), peer, &reg, &name, rc)
+            let tracker = mimesis::link::ChildTracker::new();
+            SyncObject::new((), peer, &reg, &name, tracker)
         }));
     }
 
