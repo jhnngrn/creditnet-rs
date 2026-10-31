@@ -16,7 +16,8 @@ async fn main() {
     let verbose = cfg.verbose;
     let listen = cfg.listen.clone();
 
-    let server = Server::new(cfg).expect("server init failed");
+    let mut server = Server::new(cfg).expect("server init failed");
+    creditnet::setup::register_modules(&mut server);
     let server = Arc::new(server);
 
     if let Err(e) = server.init() {
