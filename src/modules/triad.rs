@@ -477,8 +477,8 @@ impl Triad {
 // ---------------------------------------------------------------------------
 
 impl Module for Triad {
-    fn on_connect(&mut self, _peer: &str, _payload: Option<Value>) {}
-    fn on_close(&mut self, _peer: &str, _payload: Option<Value>) {}
+    fn connects_on(&self) -> &str { "commit" }
+    fn closes_on(&self) -> Vec<&str> { vec!["finalize", "cleanup", "cancel"] }
 
     fn handle_request(
         &mut self,

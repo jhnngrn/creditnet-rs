@@ -8,7 +8,7 @@ name = "creditnet"
 path = "src/main.rs"
 
 [dependencies]
-mimesis = { git = "https://github.com/jhnngrn/mimesis-rs", branch = "master" }
+mimesis = { path = "../mimesis-rs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
