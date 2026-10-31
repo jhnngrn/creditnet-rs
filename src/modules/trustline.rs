@@ -574,8 +574,7 @@ impl Module for Trustline {
         self.registry = Some(registry.clone());
         let name = self.name.clone();
         for tl in self.trustlines.values_mut() {
-            let tracker = mimesis::link::ChildTracker::new();
-            tl.reattach(registry, &name, tracker);
+            tl.reattach(registry, &name);
         }
     }
 }

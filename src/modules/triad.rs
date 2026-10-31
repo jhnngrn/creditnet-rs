@@ -630,10 +630,7 @@ impl Module for Triad {
         for nov in self.novations.values_mut() {
             for side in &mut nov.side {
                 if let Some(ref mut so) = side {
-                    // Reattach with a standalone child tracker.
-                    // TODO: should ideally get the real tracker from the ConnectionState.
-                    let tracker = mimesis::link::ChildTracker::new();
-                    so.reattach(registry, &name, tracker);
+                    so.reattach(registry, &name);
                 }
             }
         }
@@ -691,8 +688,7 @@ mod tests {
     fn set_test_factory(t: &mut Triad, reg: mimesis::registry::RegistryRef) {
         let name = t.name.clone();
         t.set_new_sync_object_fn(Box::new(move |peer| {
-            let tracker = mimesis::link::ChildTracker::new();
-            SyncObject::new((), peer, &reg, &name, tracker, mimesis::link::ConnectMode::Auto)
+            SyncObject::new((), peer, &reg, &name)
         }));
     }
 
